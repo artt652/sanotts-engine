@@ -1,0 +1,22 @@
+--- a/libespeak-ng/dictionary.c
++++ b/libespeak-ng/dictionary.c
+@@ -225,6 +225,19 @@
+ 			fprintf(stderr, "Can't read dictionary file: '%s'\n", fname);
+ 		if (f != NULL)
+ 			fclose(f);
++		// sanotts: leave a valid empty dictionary. The translator comes from
++		// malloc() and callers may still look words up in it (LookupLetter
++		// does after a failed SetTranslator3): with the tables left
++		// uninitialised that read garbage pointers and crashed on Windows.
++		tr->data_dictrules = NULL;
++		memset(tr->dict_hashtab, 0, sizeof(tr->dict_hashtab));
++		memset(tr->letterGroups, 0, sizeof(tr->letterGroups));
++		memset(tr->groups1, 0, sizeof(tr->groups1));
++		memset(tr->groups3, 0, sizeof(tr->groups3));
++		memset(tr->groups2, 0, sizeof(tr->groups2));
++		memset(tr->groups2_count, 0, sizeof(tr->groups2_count));
++		memset(tr->groups2_start, 0, sizeof(tr->groups2_start));
++		tr->n_groups2 = 0;
+ 		return 1;
+ 	}
+ 
