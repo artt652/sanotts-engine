@@ -6,7 +6,8 @@
 sanoTTS звучат в браузерной демо-версии, только собранный в обычную программу, а не в WebAssembly.
 
 - `sanotts_cli` — текст → WAV: фонемизация, синтез, паузы, выравнивание громкости, высота и тембр;
-- `sanotts_tashkeel` — расстановка огласовок в арабском тексте (нужна арабскому голосу).
+- `sanotts_tashkeel` — расстановка огласовок в арабском тексте (нужна арабскому голосу);
+- `sanotts_play` (только Android) — проигрыватель WAV через системные AAudio / OpenSL ES, без пакетов.
 
 Готовые программы для Linux, Android и Windows — в `bin/`, исходники и скрипты сборки — в `src/`.
 Сборка воспроизводима: из тех же исходников тем же компилятором получаются побайтно те же файлы
@@ -17,6 +18,7 @@ sanoTTS звучат в браузерной демо-версии, только
 ```
 bin/<платформа>/sanotts_cli[.exe]       готовые программы (таблица ниже)
 bin/<платформа>/sanotts_tashkeel[.exe]
+bin/android-*/sanotts_play              проигрыватель WAV для Android
 voices/irina/, voices/denis/             русские голоса (браузерный формат sanoTTS)
 SHA256SUMS                               sha256 всех файлов bin/ и voices/
 src/
@@ -32,6 +34,10 @@ src/
   build_android.sh       сборка для Android — PIE на системных библиотеках bionic
   make_android_sysroot.sh  sysroot для build_android.sh из исходников bionic, без Android NDK
   android_stubs.py       заглушки libc/libm/libdl для линковки и проверка API 24
+  play/
+    sanotts_play.c       проигрыватель WAV для Android: AAudio, при неудаче — OpenSL ES
+    build_android_play.sh  сборка sanotts_play (тот же sysroot, что у build_android.sh)
+    SLES/                заголовки OpenSL ES 1.0.1 (Khronos), типы — под Android
 LICENSE                  GPL-3.0
 ```
 
@@ -215,6 +221,32 @@ NDK `android_stubs.py` по картам символов bionic делает з
 приложения запускаются через системный загрузчик, а тот принимает только PIE (ET_DYN):
 статический ET_EXEC он отвергает (`has unexpected e_type: 2`).
 
+### Проигрыватель для Android — `play/build_android_play.sh`
+
+```bash
+src/play/build_android_play.sh android-sysroot aarch64-linux-android    bin/android-aarch64/sanotts_play
+src/play/build_android_play.sh android-sysroot armv7a-linux-androideabi bin/android-armv7l/sanotts_play
+src/play/build_android_play.sh android-sysroot x86_64-linux-android     bin/android-x86_64/sanotts_play
+```
+
+```
+sanotts_play [--api auto|aaudio|opensl] [--usage assistant|media|notification|alarm] [-q] FILE.wav
+sanotts_play --info FILE.wav
+```
+
+Играет WAV (PCM 8/16/24/32 бита, float32; моно или стерео) и выходит, когда звук доиграл.
+Звук — через системные библиотеки: AAudio (Android 8+), при неудаче — OpenSL ES (Android 7).
+Обе подключаются через `dlopen`, поэтому программа зависит только от `libc` и `libdl` и
+запускается так же, как `sanotts_cli`, в том числе через `/system/bin/linker64` из каталога
+приложения. Канал громкости по умолчанию — «Ассистент» (`--usage assistant`, Android 9+);
+если прошивка его не принимает, или на Android 8 и в OpenSL ES — «Медиа».
+Коды выхода: 0 — сыграно, 1 — аргументы, 2 — файл не читается или не PCM WAV, 3 — нет ни
+AAudio, ни OpenSL ES, 4 — воспроизведение не удалось.
+
+Запускать без `LD_LIBRARY_PATH` и `LD_PRELOAD`: OpenSL ES подтягивает системные библиотеки
+графики, и чужая `libjpeg.so` из `LD_LIBRARY_PATH` приложения (например, веб-сервера) ломает
+загрузку (`cannot locate symbol "jpeg_crop_scanline"`).
+
 ### Проверка
 
 ```bash
@@ -253,6 +285,7 @@ sanoTTS (`web/tashkeel/tashkeel.mjs`, без ONNX) с тем же порядко
 
 ## Лицензия
 
-GPL-3.0 (`LICENSE`): программы включают sanoTTS и espeak-ng. Код `sanotts_cli.c` и
-`sanotts_tashkeel.c` написан для этого движка и доступен также под MIT. Модель libtashkeel
+GPL-3.0 (`LICENSE`): программы включают sanoTTS и espeak-ng. Код `sanotts_cli.c`,
+`sanotts_tashkeel.c` и `sanotts_play.c` написан для этого движка и доступен также под MIT.
+Заголовки OpenSL ES в `src/play/SLES/` — Khronos Group, под их собственной лицензией (в файлах). Модель libtashkeel
 (mush42) — MIT.
