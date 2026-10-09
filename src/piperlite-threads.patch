@@ -9,7 +9,7 @@
  #define PL_HOP SNT_PIPERLITE_HOP
  
  /* ---- meta.bin parsing ------------------------------------------------- */
-@@ -137,20 +139,23 @@
+@@ -137,20 +139,28 @@
  
  /* Conv1d, PyTorch "same" semantics: pad = dil*(K/2) zeros each side.
   * w layout [out_ch, in_ch, K]; x,out channel-major [ch][T].
@@ -21,12 +21,17 @@
 + * sanotts-engine: rows [oc_lo, oc_hi) and samples [t0, t1) only -- every
 + * output value still gets exactly the same operations in the same order,
 + * so splitting the work across threads does not change a single bit. */
-+static void pl_conv1d_part(float *out, const float *x, const float *w,
++/* sanotts-engine: convolution by parts (rows and samples) for the thread
++ * pool, with a register-blocked kernel for the interior of each row.
++ * Rows [oc_lo, oc_hi), samples [t0, t1), the plain way: every addition
++ * guarded by the "same" padding. Used near the edges of a row. */
++static void pl_conv1d_edge(float *out, const float *x, const float *w,
 +                           const float *b, int in_ch, int T, int K, int dil,
 +                           int accumulate, int oc_lo, int oc_hi, int t0, int t1) {
      int pad = dil * (K / 2);
      int oc, ic, k;
 -    for (oc = 0; oc < out_ch; oc++) {
++    if (t0 >= t1) return;
 +    for (oc = oc_lo; oc < oc_hi; oc++) {
          float *orow = out + (long)oc * T;
          float bias = b[oc];
@@ -40,7 +45,7 @@
          for (ic = 0; ic < in_ch; ic++) {
              const float *xrow = x + (long)ic * T;
              const float *wrow = w + ((long)oc * in_ch + ic) * K;
-@@ -159,6 +164,8 @@
+@@ -159,6 +169,8 @@
                  int off = k * dil - pad;
                  int lo = off < 0 ? -off : 0;
                  int hi = off > 0 ? T - off : T;
@@ -49,10 +54,86 @@
                  if (wv != 0.0f)
                      for (t = lo; t < hi; t++) orow[t] += wv * xrow[t + off];
              }
-@@ -166,14 +173,57 @@
+@@ -166,14 +178,134 @@
      }
  }
  
++#define PL_VB 8            /* samples per register block */
++#define PL_OB 4            /* output rows per register block */
++
++/* Interior samples (every tap inside the row): PL_OB rows x PL_VB samples
++ * are kept in registers while all (ic, k) taps are added -- in the same
++ * order (ic ascending, then k) as the plain loop, so each value is the
++ * same bit for bit; the row is read and written once instead of in_ch*K
++ * times. */
++static void pl_conv1d_part(float *out, const float *x, const float *w,
++                           const float *b, int in_ch, int T, int K, int dil,
++                           int accumulate, int oc_lo, int oc_hi, int t0, int t1) {
++    int pad = dil * (K / 2);
++    int il = t0 > pad ? t0 : pad, ih = t1 < T - pad ? t1 : T - pad;
++    int oc, ic, k, t, v, o;
++    long ws = (long)in_ch * K;
++    if (il >= ih) { pl_conv1d_edge(out, x, w, b, in_ch, T, K, dil, accumulate, oc_lo, oc_hi, t0, t1); return; }
++    pl_conv1d_edge(out, x, w, b, in_ch, T, K, dil, accumulate, oc_lo, oc_hi, t0, il);
++    pl_conv1d_edge(out, x, w, b, in_ch, T, K, dil, accumulate, oc_lo, oc_hi, ih, t1);
++    for (oc = oc_lo; oc < oc_hi; oc += PL_OB) {
++        int nb = oc_hi - oc;
++        if (nb < PL_OB) {   /* leftover rows: one at a time */
++            for (o = 0; o < nb; o++) {
++                float *orow = out + (long)(oc + o) * T;
++                const float *wr = w + (long)(oc + o) * ws;
++                float bias = b[oc + o];
++                for (t = il; t + PL_VB <= ih; t += PL_VB) {
++                    float a[PL_VB];
++                    for (v = 0; v < PL_VB; v++) a[v] = accumulate ? orow[t + v] + bias : bias;
++                    for (ic = 0; ic < in_ch; ic++) {
++                        const float *xr = x + (long)ic * T + t - pad;
++                        for (k = 0; k < K; k++) {
++                            float wv = wr[ic * K + k];
++                            const float *xp = xr + k * dil;
++                            for (v = 0; v < PL_VB; v++) a[v] += wv * xp[v];
++                        }
++                    }
++                    for (v = 0; v < PL_VB; v++) orow[t + v] = a[v];
++                }
++                if (t < ih) pl_conv1d_edge(out, x, w, b, in_ch, T, K, dil, accumulate, oc + o, oc + o + 1, t, ih);
++            }
++            break;
++        }
++        {
++            float *r0 = out + (long)oc * T, *r1 = r0 + T, *r2 = r1 + T, *r3 = r2 + T;
++            const float *w0 = w + (long)oc * ws, *w1 = w0 + ws, *w2 = w1 + ws, *w3 = w2 + ws;
++            float b0 = b[oc], b1 = b[oc + 1], b2 = b[oc + 2], b3 = b[oc + 3];
++            for (t = il; t + PL_VB <= ih; t += PL_VB) {
++                float a0[PL_VB], a1[PL_VB], a2[PL_VB], a3[PL_VB];
++                for (v = 0; v < PL_VB; v++) {
++                    a0[v] = accumulate ? r0[t + v] + b0 : b0;
++                    a1[v] = accumulate ? r1[t + v] + b1 : b1;
++                    a2[v] = accumulate ? r2[t + v] + b2 : b2;
++                    a3[v] = accumulate ? r3[t + v] + b3 : b3;
++                }
++                for (ic = 0; ic < in_ch; ic++) {
++                    const float *xr = x + (long)ic * T + t - pad;
++                    const float *q0 = w0 + ic * K, *q1 = w1 + ic * K, *q2 = w2 + ic * K, *q3 = w3 + ic * K;
++                    for (k = 0; k < K; k++) {
++                        const float *xp = xr + k * dil;
++                        float c0 = q0[k], c1 = q1[k], c2 = q2[k], c3 = q3[k];
++                        for (v = 0; v < PL_VB; v++) {
++                            float xv = xp[v];
++                            a0[v] += c0 * xv;
++                            a1[v] += c1 * xv;
++                            a2[v] += c2 * xv;
++                            a3[v] += c3 * xv;
++                        }
++                    }
++                }
++                for (v = 0; v < PL_VB; v++) { r0[t + v] = a0[v]; r1[t + v] = a1[v]; r2[t + v] = a2[v]; r3[t + v] = a3[v]; }
++            }
++            if (t < ih) pl_conv1d_edge(out, x, w, b, in_ch, T, K, dil, accumulate, oc, oc + PL_OB, t, ih);
++        }
++    }
++}
++
 +typedef struct {
 +    float *out; const float *x, *w, *b;
 +    int in_ch, out_ch, T, K, dil, accumulate, by_time;
@@ -90,7 +171,8 @@
 +        snt_par_for(T, chunk < 1024 ? 1024 : chunk, pl_conv1d_run, &j);
 +    } else {
 +        long chunk = out_ch / (4L * nt);
-+        snt_par_for(out_ch, chunk < 1 ? 1 : chunk, pl_conv1d_run, &j);
++        chunk = (chunk + PL_OB - 1) / PL_OB * PL_OB;     /* whole register blocks */
++        snt_par_for(out_ch, chunk < PL_OB ? PL_OB : chunk, pl_conv1d_run, &j);
 +    }
 +}
 +
@@ -112,7 +194,7 @@
          float *orow = out + (long)oc * L;
          float bias = b[oc];
          int j;
-@@ -199,6 +249,33 @@
+@@ -199,6 +331,33 @@
      }
  }
  
