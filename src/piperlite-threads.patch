@@ -1,0 +1,148 @@
+--- snt_piperlite.c
++++ snt_piperlite.c
+@@ -13,6 +13,8 @@
+ #include <math.h>
+ #include <string.h>
+ 
++#include "snt_par.h"   /* sanotts-engine: convolutions split across threads */
++
+ #define PL_HOP SNT_PIPERLITE_HOP
+ 
+ /* ---- meta.bin parsing ------------------------------------------------- */
+@@ -137,20 +139,23 @@
+ 
+ /* Conv1d, PyTorch "same" semantics: pad = dil*(K/2) zeros each side.
+  * w layout [out_ch, in_ch, K]; x,out channel-major [ch][T].
+- * accumulate!=0: out += bias + conv; else out = bias + conv. */
+-static void pl_conv1d(float *out, const float *x, const float *w,
+-                      const float *b, int in_ch, int out_ch, int T,
+-                      int K, int dil, int accumulate) {
++ * accumulate!=0: out += bias + conv; else out = bias + conv.
++ * sanotts-engine: rows [oc_lo, oc_hi) and samples [t0, t1) only -- every
++ * output value still gets exactly the same operations in the same order,
++ * so splitting the work across threads does not change a single bit. */
++static void pl_conv1d_part(float *out, const float *x, const float *w,
++                           const float *b, int in_ch, int T, int K, int dil,
++                           int accumulate, int oc_lo, int oc_hi, int t0, int t1) {
+     int pad = dil * (K / 2);
+     int oc, ic, k;
+-    for (oc = 0; oc < out_ch; oc++) {
++    for (oc = oc_lo; oc < oc_hi; oc++) {
+         float *orow = out + (long)oc * T;
+         float bias = b[oc];
+         int t;
+         if (accumulate)
+-            for (t = 0; t < T; t++) orow[t] += bias;
++            for (t = t0; t < t1; t++) orow[t] += bias;
+         else
+-            for (t = 0; t < T; t++) orow[t] = bias;
++            for (t = t0; t < t1; t++) orow[t] = bias;
+         for (ic = 0; ic < in_ch; ic++) {
+             const float *xrow = x + (long)ic * T;
+             const float *wrow = w + ((long)oc * in_ch + ic) * K;
+@@ -159,6 +164,8 @@
+                 int off = k * dil - pad;
+                 int lo = off < 0 ? -off : 0;
+                 int hi = off > 0 ? T - off : T;
++                if (lo < t0) lo = t0;
++                if (hi > t1) hi = t1;
+                 if (wv != 0.0f)
+                     for (t = lo; t < hi; t++) orow[t] += wv * xrow[t + off];
+             }
+@@ -166,14 +173,57 @@
+     }
+ }
+ 
++typedef struct {
++    float *out; const float *x, *w, *b;
++    int in_ch, out_ch, T, K, dil, accumulate, by_time;
++} pl_conv_job;
++
++static void pl_conv1d_run(void *ctx, long lo, long hi) {
++    const pl_conv_job *j = (const pl_conv_job *)ctx;
++    if (j->by_time)
++        pl_conv1d_part(j->out, j->x, j->w, j->b, j->in_ch, j->T, j->K, j->dil,
++                       j->accumulate, 0, j->out_ch, (int)lo, (int)hi);
++    else
++        pl_conv1d_part(j->out, j->x, j->w, j->b, j->in_ch, j->T, j->K, j->dil,
++                       j->accumulate, (int)lo, (int)hi, 0, j->T);
++}
++
++/* Work below this many multiply-adds is not worth waking the threads. */
++#define PL_PAR_MIN_WORK 262144L
++
++static void pl_conv1d(float *out, const float *x, const float *w,
++                      const float *b, int in_ch, int out_ch, int T,
++                      int K, int dil, int accumulate) {
++    int nt = snt_par_threads();
++    pl_conv_job j;
++    if (nt <= 1 || (long)out_ch * in_ch * K * T < PL_PAR_MIN_WORK) {
++        pl_conv1d_part(out, x, w, b, in_ch, T, K, dil, accumulate, 0, out_ch, 0, T);
++        return;
++    }
++    j.out = out; j.x = x; j.w = w; j.b = b; j.in_ch = in_ch; j.out_ch = out_ch;
++    j.T = T; j.K = K; j.dil = dil; j.accumulate = accumulate;
++    /* Enough rows: split by output channel (small chunks -- big.LITTLE
++     * cores take what they can); a single row (post conv): split by time. */
++    j.by_time = out_ch < 2 * nt;
++    if (j.by_time) {
++        long chunk = T / (4L * nt);
++        snt_par_for(T, chunk < 1024 ? 1024 : chunk, pl_conv1d_run, &j);
++    } else {
++        long chunk = out_ch / (4L * nt);
++        snt_par_for(out_ch, chunk < 1 ? 1 : chunk, pl_conv1d_run, &j);
++    }
++}
++
+ /* ConvTranspose1d, w layout [in_ch, out_ch, K]; out length
+- * (T-1)*stride - 2*pad + K. Scatter form, exact PyTorch semantics. */
+-static void pl_convtr1d(float *out, const float *x, const float *w,
+-                        const float *b, int in_ch, int out_ch, int T,
+-                        int K, int stride, int pad) {
++ * (T-1)*stride - 2*pad + K. Scatter form, exact PyTorch semantics.
++ * sanotts-engine: rows [oc_lo, oc_hi) -- the order of additions into each
++ * output value is unchanged, so threads do not change the result. */
++static void pl_convtr1d_part(float *out, const float *x, const float *w,
++                             const float *b, int in_ch, int out_ch, int T,
++                             int K, int stride, int pad, int oc_lo, int oc_hi) {
+     int L = (T - 1) * stride - 2 * pad + K;
+     int oc, ic, k;
+-    for (oc = 0; oc < out_ch; oc++) {
++    for (oc = oc_lo; oc < oc_hi; oc++) {
+         float *orow = out + (long)oc * L;
+         float bias = b[oc];
+         int j;
+@@ -199,6 +249,33 @@
+     }
+ }
+ 
++typedef struct {
++    float *out; const float *x, *w, *b;
++    int in_ch, out_ch, T, K, stride, pad;
++} pl_convtr_job;
++
++static void pl_convtr1d_run(void *ctx, long lo, long hi) {
++    const pl_convtr_job *j = (const pl_convtr_job *)ctx;
++    pl_convtr1d_part(j->out, j->x, j->w, j->b, j->in_ch, j->out_ch, j->T,
++                     j->K, j->stride, j->pad, (int)lo, (int)hi);
++}
++
++static void pl_convtr1d(float *out, const float *x, const float *w,
++                        const float *b, int in_ch, int out_ch, int T,
++                        int K, int stride, int pad) {
++    int nt = snt_par_threads();
++    pl_convtr_job j;
++    long chunk;
++    if (nt <= 1 || out_ch < 2 * nt || (long)out_ch * in_ch * K * T < PL_PAR_MIN_WORK) {
++        pl_convtr1d_part(out, x, w, b, in_ch, out_ch, T, K, stride, pad, 0, out_ch);
++        return;
++    }
++    j.out = out; j.x = x; j.w = w; j.b = b; j.in_ch = in_ch; j.out_ch = out_ch;
++    j.T = T; j.K = K; j.stride = stride; j.pad = pad;
++    chunk = out_ch / (4L * nt);
++    snt_par_for(out_ch, chunk < 1 ? 1 : chunk, pl_convtr1d_run, &j);
++}
++
+ /* PiperResidualBank: 3 branches (kernel, dil1, dil2) = (3,1,2), (5,2,6),
+  * (7,3,12); each branch y1 = conv1(lrelu(x)) + x, y2 = conv2(lrelu(y1)) + y1;
+  * bank out = (y2_0 + y2_1 + y2_2) / 3. `ws` points at the 12 bank slots.

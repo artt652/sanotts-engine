@@ -37,9 +37,9 @@ LIB=(common.c mnemonics.c error.c ieee80.c compiledata.c compiledict.c
 UCD=(case.c categories.c ctype.c proplist.c scripts.c tostring.c)
 
 # Windows (mingw): недостающие POSIX-заголовки (endian.h) — из wincompat/.
-EXTRA=(); LIBS=(-lm)
+EXTRA=(); LIBS=(-lm); THREADLIB=(-pthread)
 # (без grep -q: под pipefail ранний выход grep обрывал конвейер и проверка «не срабатывала»)
-if "$CC" -dM -E -x c /dev/null 2>/dev/null | grep '_WIN32' >/dev/null; then EXTRA=(-I"$HERE/wincompat"); LIBS=(-lshell32); fi
+if "$CC" -dM -E -x c /dev/null 2>/dev/null | grep '_WIN32' >/dev/null; then EXTRA=(-I"$HERE/wincompat"); LIBS=(-lshell32); THREADLIB=(); fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -48,6 +48,9 @@ trap 'rm -rf "$tmp"' EXIT
 cp -r "$ESP" "$tmp/espeak"
 patch -s -p1 -d "$tmp/espeak" < "$HERE/espeak-fixes.patch"
 ESP="$tmp/espeak"
+# Декодер — из копии с piperlite-threads.patch: свёртки делятся между потоками
+# (snt_par.c); результат побайтно тот же, что у однопоточной версии.
+patch -s -o "$tmp/snt_piperlite.c" "$M/src/snt_piperlite.c" "$HERE/piperlite-threads.patch"
 # Временный путь не должен попадать в бинарник (__FILE__ в assert) — сборка воспроизводима.
 PFX=(-ffile-prefix-map="$tmp"=/build)
 objs=()
@@ -63,11 +66,11 @@ done
 
 # Без -march=native: бинарник должен работать на любом CPU этой архитектуры.
 "$CC" -O3 -std=gnu99 -static -s -ffunction-sections -fdata-sections -Wl,--gc-sections -DLIBESPEAK_NG_EXPORT \
-  -I"$ESP/include" -I"$M/include" -I"$M/src" -I"$M/ports/wasm" \
+  -I"$HERE" -I"$ESP/include" -I"$M/include" -I"$M/src" -I"$M/ports/wasm" "${PFX[@]}" \
   -o "$OUT" \
-  "$HERE/sanotts_cli.c" "$HERE/snt_g2p.c" \
-  "$M/ports/wasm/snt_voice_wasm.c" "$M/src/snt_front_f32.c" "$M/src/snt_piperlite.c" \
-  "${objs[@]}" "${LIBS[@]}"
+  "$HERE/sanotts_cli.c" "$HERE/snt_g2p.c" "$HERE/snt_par.c" \
+  "$M/ports/wasm/snt_voice_wasm.c" "$M/src/snt_front_f32.c" "$tmp/snt_piperlite.c" \
+  "${objs[@]}" "${LIBS[@]}" ${THREADLIB[@]+"${THREADLIB[@]}"}
 echo "built $OUT ($(wc -c <"$OUT") bytes)"
 
 # Утилита огласовок для арабского (tashkeel/) — отдельная программа рядом с движком.

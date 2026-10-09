@@ -50,6 +50,8 @@ trap 'rm -rf "$tmp"' EXIT
 cp -r "$ESP" "$tmp/espeak"
 patch -s -p1 -d "$tmp/espeak" < "$HERE/espeak-fixes.patch"
 ESP="$tmp/espeak"
+# Декодер — из копии с piperlite-threads.patch (см. build_static.sh).
+patch -s -o "$tmp/snt_piperlite.c" "$M/src/snt_piperlite.c" "$HERE/piperlite-threads.patch"
 # Временный путь не должен попадать в бинарник (__FILE__ в assert) — сборка воспроизводима.
 CC+=(-ffile-prefix-map="$tmp"=/build)
 objs=()
@@ -62,10 +64,10 @@ for f in "${UCD[@]}"; do
   "${CC[@]}" -c -Os -ffunction-sections -fdata-sections -std=gnu11 -w -I"$ESP/ucd-tools/include" "$ESP/ucd-tools/$f" -o "$tmp/ucd_${f%.c}.o"
   objs+=("$tmp/ucd_${f%.c}.o")
 done
-for f in "$HERE/sanotts_cli.c" "$HERE/snt_g2p.c" "$M/ports/wasm/snt_voice_wasm.c" \
-         "$M/src/snt_front_f32.c" "$M/src/snt_piperlite.c"; do
+for f in "$HERE/sanotts_cli.c" "$HERE/snt_g2p.c" "$HERE/snt_par.c" "$M/ports/wasm/snt_voice_wasm.c" \
+         "$M/src/snt_front_f32.c" "$tmp/snt_piperlite.c"; do
   b="$(basename "${f%.c}")"
-  "${CC[@]}" -c -O3 -ffunction-sections -fdata-sections -std=gnu99 -w -I"$ESP/include" -I"$M/include" -I"$M/src" -I"$M/ports/wasm" "$f" -o "$tmp/$b.o"
+  "${CC[@]}" -c -O3 -ffunction-sections -fdata-sections -std=gnu99 -w -I"$HERE" -I"$ESP/include" -I"$M/include" -I"$M/src" -I"$M/ports/wasm" "$f" -o "$tmp/$b.o"
   objs+=("$tmp/$b.o")
 done
 

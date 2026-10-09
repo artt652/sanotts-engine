@@ -26,6 +26,9 @@
  *     -B  bass, dB (low shelf 250 Hz);  -T  treble, dB (high shelf 3500 Hz)
  *     -I  input lines are phoneme ids ("1 0 17 0 ... 2"), one utterance per
  *         line, as built by an external text frontend (see --g2p)
+ *     -j  threads for the decoder (default: CPUs this process may use, at
+ *         most 4; also $SANOTTS_THREADS); -j 1 = single-threaded. The result
+ *         is the same bit for bit whatever the number of threads.
  *   sanotts_cli --g2p [espeak_voice slot]  (stdin line N -> "=N id id ..." on stdout)
  *   sanotts_cli --ids TEXT [espeak_voice slot]  (debug: ids of one text)
  * Exit code 0 on success; errors go to stderr.
@@ -40,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "snt_par.h"
 #include <espeak-ng/speak_lib.h>
 #include <espeak-ng/espeak_ng.h>
 #include <limits.h>
@@ -554,10 +558,10 @@ static void finish_wav(synth_ctx *cx, float *pcm, size_t n, size_t lead_n, int c
     }
     if (f != stdout) fclose(f);
     if (!isnan(target) && isfinite(before))
-        fprintf(stderr, "sanotts_cli: %.2fs at %d Hz, %d chunk(s), loudness %.1f -> %.1f LUFS (gain %+.1f dB, limiter %.1f dB)\n",
-                (double)n / rate, rate, chunks, before, loudness(speech, sn, rate), gain_db, lim_db);
+        fprintf(stderr, "sanotts_cli: %.2fs at %d Hz, %d chunk(s), %d thread(s), loudness %.1f -> %.1f LUFS (gain %+.1f dB, limiter %.1f dB)\n",
+                (double)n / rate, rate, chunks, snt_par_threads(), before, loudness(speech, sn, rate), gain_db, lim_db);
     else
-        fprintf(stderr, "sanotts_cli: %.2fs at %d Hz, %d chunk(s)\n", (double)n / rate, rate, chunks);
+        fprintf(stderr, "sanotts_cli: %.2fs at %d Hz, %d chunk(s), %d thread(s)\n", (double)n / rate, rate, chunks, snt_par_threads());
 }
 
 int main(int argc, char **argv) {
@@ -617,7 +621,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     float tempo = 1.0f, pause = 0.15f, lead = 0.0f;
-    int ids_input = 0;
+    int ids_input = 0, threads = 0;
     double semis = 0.0, bass = 0.0, treble = 0.0;
     double target = -16.0;                             /* LUFS; NAN = peak only */
     for (int i = 1; i < argc; i++) {
@@ -634,9 +638,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-B") && v) { bass = atof(v); i++; }
         else if (!strcmp(a, "-T") && v) { treble = atof(v); i++; }
         else if (!strcmp(a, "-L") && v) { target = strcmp(v, "off") ? atof(v) : NAN; i++; }
-        else die("usage: sanotts_cli -v VOICE_DIR (-o OUT.wav | -O PREFIX) [-s tempo] [-p pause] [-l lead] [-L lufs|off] [-P semitones] [-B db] [-T db] [-I] [-t text]", NULL);
+        else if (!strcmp(a, "-j") && v) { threads = atoi(v); i++; }
+        else die("usage: sanotts_cli -v VOICE_DIR (-o OUT.wav | -O PREFIX) [-s tempo] [-p pause] [-l lead] [-L lufs|off] [-P semitones] [-B db] [-T db] [-j threads] [-I] [-t text]", NULL);
     }
     if (!voice_dir || (!out_path && !stream_prefix)) die("-v and -o (or -O) are required", NULL);
+    if (threads <= 0 && getenv("SANOTTS_THREADS")) threads = atoi(getenv("SANOTTS_THREADS"));
+    snt_par_init(threads);
     if (tempo <= 0.0f) tempo = 1.0f;
 
     char meta_path[4096];
