@@ -54,7 +54,7 @@
                  if (wv != 0.0f)
                      for (t = lo; t < hi; t++) orow[t] += wv * xrow[t + off];
              }
-@@ -166,14 +178,134 @@
+@@ -166,39 +178,288 @@
      }
  }
  
@@ -181,23 +181,163 @@
 -static void pl_convtr1d(float *out, const float *x, const float *w,
 -                        const float *b, int in_ch, int out_ch, int T,
 -                        int K, int stride, int pad) {
-+ * (T-1)*stride - 2*pad + K. Scatter form, exact PyTorch semantics.
-+ * sanotts-engine: rows [oc_lo, oc_hi) -- the order of additions into each
-+ * output value is unchanged, so threads do not change the result. */
-+static void pl_convtr1d_part(float *out, const float *x, const float *w,
-+                             const float *b, int in_ch, int out_ch, int T,
-+                             int K, int stride, int pad, int oc_lo, int oc_hi) {
-     int L = (T - 1) * stride - 2 * pad + K;
-     int oc, ic, k;
+-    int L = (T - 1) * stride - 2 * pad + K;
+-    int oc, ic, k;
 -    for (oc = 0; oc < out_ch; oc++) {
++ * L = (T-1)*stride - 2*pad + K, exact PyTorch semantics.
++ * sanotts-engine: computed per output value ("gather") instead of the
++ * original scatter. Output j receives w[ic][oc][k] * x[ic][t] for every
++ * t*stride + k - pad == j; these are added in the original order -- ic
++ * ascending, then k ascending -- so each value is the same bit for bit,
++ * whatever the thread count. Rows [oc_lo, oc_hi). */
++
++/* Plain gather for outputs [j0, j1): edges, and shapes the fast path skips. */
++static void pl_convtr1d_edge(float *out, const float *x, const float *w,
++                             const float *b, int in_ch, int out_ch, int T,
++                             int K, int stride, int pad, int L,
++                             int oc_lo, int oc_hi, int j0, int j1) {
++    int oc, ic, j, k;
 +    for (oc = oc_lo; oc < oc_hi; oc++) {
          float *orow = out + (long)oc * L;
-         float bias = b[oc];
-         int j;
-@@ -199,6 +331,33 @@
+-        float bias = b[oc];
+-        int j;
+-        for (j = 0; j < L; j++) orow[j] = bias;
+-        for (ic = 0; ic < in_ch; ic++) {
+-            const float *xrow = x + (long)ic * T;
+-            const float *wrow = w + ((long)ic * out_ch + oc) * K;
+-            for (k = 0; k < K; k++) {
+-                float wv = wrow[k];
+-                int shift = k - pad;
+-                /* j = t*stride + shift must satisfy 0 <= j < L */
+-                int t_lo = 0, t_hi = T, t;
+-                long lim;
+-                if (shift >= L) continue;
+-                if (shift < 0)
+-                    t_lo = (-shift + stride - 1) / stride;
+-                lim = ((long)L - 1 - shift) / stride + 1;
+-                if (lim < t_hi) t_hi = (int)lim;
+-                for (t = t_lo; t < t_hi; t++)
+-                    orow[(long)t * stride + shift] += wv * xrow[t];
++        for (j = j0; j < j1; j++) {
++            int q = j + pad, r = q % stride;
++            float a = b[oc];
++            for (ic = 0; ic < in_ch; ic++) {
++                const float *xrow = x + (long)ic * T;
++                const float *wrow = w + ((long)ic * out_ch + oc) * K;
++                for (k = r; k < K && k <= q; k += stride) {
++                    int t = (q - k) / stride;
++                    if (t < T) a += wrow[k] * xrow[t];
++                }
+             }
++            orow[j] = a;
++        }
++    }
++}
++
++/* Interior, by phase: output j = tq*s + r - pad (r = 0..s-1) takes taps
++ * k = r + m*s from x[tq - m], m = 0..K/s-1. For each phase r, PL_OB rows x
++ * PL_VB consecutive tq stay in registers: per (ic, m) a scalar weight times
++ * a contiguous run of x, as in pl_conv1d_part. Outputs land s apart and are
++ * written once. K and s are literals at the call sites (the decoder's 16/8
++ * and 8/4), so the loops unroll; other shapes take the plain gather. */
++#if defined(__GNUC__) || defined(__clang__)
++#define PL_INLINE static inline __attribute__((always_inline))
++#else
++#define PL_INLINE static inline
++#endif
++PL_INLINE void pl_convtr1d_blocks(float *out, const float *x, const float *w,
++                                  const float *b, int in_ch, int out_ch, int T,
++                                  const int K, const int s, int pad, int L,
++                                  int oc_lo, int oc_hi, int tlo, int thi) {
++    const int nk = K / s;
++    int oc, ic, tq, m, v, o, r;
++    for (oc = oc_lo; oc < oc_hi; oc += PL_OB) {
++        int nb = oc_hi - oc;
++        if (nb < PL_OB) {   /* leftover rows: one at a time */
++            for (o = 0; o < nb; o++) {
++                float *orow = out + (long)(oc + o) * L;
++                float bias = b[oc + o];
++                for (r = 0; r < s; r++)
++                    for (tq = tlo; tq < thi; tq += PL_VB) {
++                        float a[PL_VB];
++                        for (v = 0; v < PL_VB; v++) a[v] = bias;
++                        for (ic = 0; ic < in_ch; ic++) {
++                            const float *xr = x + (long)ic * T + tq;
++                            const float *wp = w + ((long)ic * out_ch + oc + o) * K + r;
++                            for (m = 0; m < nk; m++) {
++                                float wv = wp[m * s];
++                                const float *xp = xr - m;
++                                for (v = 0; v < PL_VB; v++) a[v] += wv * xp[v];
++                            }
++                        }
++                        for (v = 0; v < PL_VB; v++) orow[(long)(tq + v) * s + r - pad] = a[v];
++                    }
++            }
++            break;
++        }
++        {
++            float *r0 = out + (long)oc * L, *r1 = r0 + L, *r2 = r1 + L, *r3 = r2 + L;
++            float b0 = b[oc], b1 = b[oc + 1], b2 = b[oc + 2], b3 = b[oc + 3];
++            for (r = 0; r < s; r++)
++                for (tq = tlo; tq < thi; tq += PL_VB) {
++                    float a0[PL_VB], a1[PL_VB], a2[PL_VB], a3[PL_VB];
++                    long jb = (long)tq * s + r - pad;
++                    for (v = 0; v < PL_VB; v++) { a0[v] = b0; a1[v] = b1; a2[v] = b2; a3[v] = b3; }
++                    for (ic = 0; ic < in_ch; ic++) {
++                        const float *xr = x + (long)ic * T + tq;
++                        const float *q0 = w + ((long)ic * out_ch + oc) * K + r, *q1 = q0 + K, *q2 = q1 + K, *q3 = q2 + K;
++                        for (m = 0; m < nk; m++) {
++                            const float *xp = xr - m;
++                            float c0 = q0[m * s], c1 = q1[m * s], c2 = q2[m * s], c3 = q3[m * s];
++                            for (v = 0; v < PL_VB; v++) {
++                                float xv = xp[v];
++                                a0[v] += c0 * xv;
++                                a1[v] += c1 * xv;
++                                a2[v] += c2 * xv;
++                                a3[v] += c3 * xv;
++                            }
++                        }
++                    }
++                    for (v = 0; v < PL_VB; v++) {
++                        long j = jb + (long)v * s;
++                        r0[j] = a0[v]; r1[j] = a1[v]; r2[j] = a2[v]; r3[j] = a3[v];
++                    }
++                }
+         }
      }
  }
  
++static void pl_convtr1d_part(float *out, const float *x, const float *w,
++                             const float *b, int in_ch, int out_ch, int T,
++                             int K, int stride, int pad, int oc_lo, int oc_hi) {
++    int L = (T - 1) * stride - 2 * pad + K;
++    int s = stride, nk, tlo, thi, jlo, jhi;
++    int fast = (s == 8 && K == 16) || (s == 4 && K == 8);
++    if (!fast || pad < 0) {
++        pl_convtr1d_edge(out, x, w, b, in_ch, out_ch, T, K, s, pad, L, oc_lo, oc_hi, 0, L);
++        return;
++    }
++    nk = K / s;
++    /* tq range where every tap is inside x and every phase inside the row:
++     * tq - (nk-1) >= 0, tq*s - pad >= 0; tq+PL_VB <= T, (tq+PL_VB)*s - pad <= L. */
++    tlo = (pad + s - 1) / s;
++    if (tlo < nk - 1) tlo = nk - 1;
++    thi = tlo;
++    while (thi + PL_VB <= T && (long)(thi + PL_VB) * s - pad <= L) thi += PL_VB;
++    if (thi == tlo) {
++        pl_convtr1d_edge(out, x, w, b, in_ch, out_ch, T, K, s, pad, L, oc_lo, oc_hi, 0, L);
++        return;
++    }
++    jlo = tlo * s - pad;            /* interior outputs: [jlo, jhi) */
++    jhi = thi * s - pad;
++    pl_convtr1d_edge(out, x, w, b, in_ch, out_ch, T, K, s, pad, L, oc_lo, oc_hi, 0, jlo);
++    pl_convtr1d_edge(out, x, w, b, in_ch, out_ch, T, K, s, pad, L, oc_lo, oc_hi, jhi, L);
++    if (s == 8)
++        pl_convtr1d_blocks(out, x, w, b, in_ch, out_ch, T, 16, 8, pad, L, oc_lo, oc_hi, tlo, thi);
++    else
++        pl_convtr1d_blocks(out, x, w, b, in_ch, out_ch, T, 8, 4, pad, L, oc_lo, oc_hi, tlo, thi);
++}
++
 +typedef struct {
 +    float *out; const float *x, *w, *b;
 +    int in_ch, out_ch, T, K, stride, pad;
@@ -222,7 +362,8 @@
 +    j.out = out; j.x = x; j.w = w; j.b = b; j.in_ch = in_ch; j.out_ch = out_ch;
 +    j.T = T; j.K = K; j.stride = stride; j.pad = pad;
 +    chunk = out_ch / (4L * nt);
-+    snt_par_for(out_ch, chunk < 1 ? 1 : chunk, pl_convtr1d_run, &j);
++    chunk = (chunk + PL_OB - 1) / PL_OB * PL_OB;         /* whole register blocks */
++    snt_par_for(out_ch, chunk < PL_OB ? PL_OB : chunk, pl_convtr1d_run, &j);
 +}
 +
  /* PiperResidualBank: 3 branches (kernel, dil1, dil2) = (3,1,2), (5,2,6),
